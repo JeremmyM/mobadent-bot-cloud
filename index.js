@@ -12,9 +12,7 @@ import http from "http";
 
 const logger = pino({ level: "info" });
 
-// -------------------------------------------------------------------------
-// 1. SERVIDOR HTTP OBLIGATORIO PARA RENDER
-// -------------------------------------------------------------------------
+// 1. SERVIDOR HTTP PARA RENDER WEB SERVICE
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -23,9 +21,7 @@ http.createServer((req, res) => {
   console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT}`);
 });
 
-// -------------------------------------------------------------------------
 // 2. CONFIGURACIÓN Y VARIABLES DE ENTORNO
-// -------------------------------------------------------------------------
 const DATABASE_URL = process.env.DATABASE_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -48,18 +44,16 @@ if (!fs.existsSync(SESSION_DIR)) {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
-// -------------------------------------------------------------------------
-// 3. PERSISTENCIA ROBUSTA DE SESIÓN CON SUPABASE STORAGE
-// -------------------------------------------------------------------------
+// 3. PERSISTENCIA DE SESIÓN EN SUPABASE STORAGE
 async function descargarSesionSupabase() {
   console.log("⬇️ Verificando y descargando sesión desde Supabase...");
   try {
     const { data: files, error } = await supabase.storage
       .from(SUPABASE_BUCKET)
-      .list("", { limit: 1000, sortBy: { column: "name", order: "asc" } });
+      .list("", { limit: 1000 });
 
     if (error) {
-      console.error("❌ Error listando archivos de sesión en Supabase:", error.message);
+      console.error("❌ Error listando archivos en Supabase:", error.message);
       return;
     }
 
@@ -87,9 +81,9 @@ async function sincronizarArchivosASupabase() {
     if (!fs.existsSync(SESSION_DIR)) return;
     const archivos = fs.readdirSync(SESSION_DIR);
     for (const archivo of archivos) {
-      const rutaCompleta = path.join(SESSION_DIR, archivo);
-      if (fs.lstatSync(rutaCompleta).isFile()) {
-        const fileBuffer = fs.readFileSync(rutaCompleta);
+      const ruta = path.join(SESSION_DIR, archivo);
+      if (fs.lstatSync(ruta).isFile()) {
+        const fileBuffer = fs.readFileSync(ruta);
         await supabase.storage.from(SUPABASE_BUCKET).upload(archivo, fileBuffer, { upsert: true });
       }
     }
@@ -98,16 +92,12 @@ async function sincronizarArchivosASupabase() {
   }
 }
 
-// -------------------------------------------------------------------------
-// 4. CONSULTA DE CARTERA DIRECTA EN NEON
-// -------------------------------------------------------------------------
+// 4. CONSULTA DE CARTERA EN NEON POSTGRESQL
 async function consultarCarteraPorTelefono(telefonoLimpio) {
   const digitos = telefonoLimpio.replace(/\D/g, "");
-  console.log(`🔍 [BOT] Evaluando número entrante: "${telefonoLimpio}" -> Dígitos: "${digitos}"`);
+  console.log(`🔍 [BOT] Evaluando número: "${telefonoLimpio}" -> Dígitos: "${digitos}"`);
 
-  if (!digitos || digitos.length < 7) {
-    return null;
-  }
+  if (!digitos || digitos.length < 7) return null;
 
   const ultimos8 = digitos.slice(-8);
   const ultimos7 = digitos.slice(-7);
@@ -137,9 +127,7 @@ async function consultarCarteraPorTelefono(telefonoLimpio) {
   }
 }
 
-// -------------------------------------------------------------------------
 // 5. INICIALIZACIÓN DEL BOT
-// -------------------------------------------------------------------------
 async function iniciarBot() {
   await descargarSesionSupabase();
 
@@ -154,22 +142,25 @@ async function iniciarBot() {
     defaultQueryTimeoutMs: 60000
   });
 
-  // Guardar credenciales de inmediato cuando Baileys las actualice
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     await sincronizarArchivosASupabase();
   });
 
-  // Sincronizador periódico de respaldo cada 30 segundos para llaves nuevas
   const syncInterval = setInterval(async () => {
     if (sock.authState?.creds?.registered) {
       await sincronizarArchivosASupabase();
     }
   }, 30000);
 
-  // Solo si NO está registrado en absoluto se pide el Pairing Code
-  if (!sock.authState.creds.registered && PHONE_NUMBER) {
-    setTimeout(async () => {
+  let pairingCodeSolicitado = false;
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    // Solo solicitar código cuando el WebSocket ya está listo (qr disponible) y no está registrado
+    if (qr && !sock.authState.creds.registered && PHONE_NUMBER && !pairingCodeSolicitado) {
+      pairingCodeSolicitado = true;
       try {
         const cleanNumber = PHONE_NUMBER.replace(/\D/g, "");
         const code = await sock.requestPairingCode(cleanNumber);
@@ -177,24 +168,21 @@ async function iniciarBot() {
         console.log(`📲 CÓDIGO DE VINCULACIÓN: ${code}`);
         console.log("=======================================================\n");
       } catch (err) {
-        console.error("Error solicitando Pairing Code:", err);
+        pairingCodeSolicitado = false;
+        console.error("Error solicitando Pairing Code:", err.message);
       }
-    }, 4000);
-  }
-
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
+    }
 
     if (connection === "close") {
       clearInterval(syncInterval);
       const statusCode = lastDisconnect?.error?.output?.statusCode;
+      console.log(`⚠️ Conexión cerrada (status: ${statusCode}). Reintentando...`);
       if (statusCode !== DisconnectReason.loggedOut) {
         setTimeout(iniciarBot, 5000);
       }
     } else if (connection === "open") {
       console.log("\n🟢 Mobadent Bot Cloud CONECTADO y activo 24/7.\n");
-      // Sincronizar inmediatamente tras conexión exitosa
-      sincronizarArchivosASupabase();
+      await sincronizarArchivosASupabase();
     }
   });
 
@@ -215,9 +203,7 @@ async function iniciarBot() {
 
       if (!texto) continue;
 
-      // Extracción de número real prioritaria sobre LIDs
       let telefonoReal = "";
-
       if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes("@s.whatsapp.net")) {
         telefonoReal = msg.key.remoteJidAlt.split("@")[0];
       } else if (msg.key.participantPn) {
@@ -235,9 +221,7 @@ async function iniciarBot() {
         } catch (_) {}
       }
 
-      if (!telefonoReal) {
-        telefonoReal = remoteJid.split("@")[0];
-      }
+      if (!telefonoReal) telefonoReal = remoteJid.split("@")[0];
 
       try {
         if (/SALDO|DEUDA|CUENTA|ESTADO/.test(texto)) {
@@ -294,9 +278,5 @@ async function iniciarBot() {
     }
   });
 }
-
-
-
-
 
 iniciarBot().catch(console.error);
