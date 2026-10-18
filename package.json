@@ -1,0 +1,19 @@
+{
+  "name": "mobadent-bot-cloud",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp 24/7 para Mobadent conectado directamente a Neon y Supabase",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8",
+    "@supabase/supabase-js": "^2.45.0",
+    "pg": "^8.12.0",
+    "qrcode-terminal": "^0.12.0",
+    "pino": "^9.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
