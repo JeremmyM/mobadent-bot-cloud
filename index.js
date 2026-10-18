@@ -135,7 +135,7 @@ async function iniciarBot() {
     version,
     auth: state,
     logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
+    printQRInTerminal: true, // <-- Cambiar a true
     defaultQueryTimeoutMs: 60000
   });
 
