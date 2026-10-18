@@ -12,7 +12,9 @@ import http from "http";
 
 const logger = pino({ level: "info" });
 
-// 1. Mantener puerto HTTP activo para que Render Web Service no aborte
+// -------------------------------------------------------------------------
+// 1. SERVIDOR HTTP OBLIGATORIO PARA RENDER WEB SERVICE
+// -------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -21,16 +23,18 @@ http.createServer((req, res) => {
   console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT}`);
 });
 
-// 2. Variables de entorno
+// -------------------------------------------------------------------------
+// 2. CONFIGURACIÓN Y VARIABLES DE ENTORNO
+// -------------------------------------------------------------------------
 const DATABASE_URL = process.env.DATABASE_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const PHONE_NUMBER = process.env.WHATSAPP_PHONE; // Número con prefijo (Ej: 5939XXXXXXXX)
+const PHONE_NUMBER = process.env.WHATSAPP_PHONE;
 const SUPABASE_BUCKET = "whatsapp-session";
 const SESSION_DIR = path.resolve("./auth_session");
 
 if (!DATABASE_URL || !SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("❌ Faltan variables de entorno esenciales.");
+  console.error("❌ Faltan variables de entorno esenciales: DATABASE_URL, SUPABASE_URL o SUPABASE_KEY.");
   process.exit(1);
 }
 
@@ -44,6 +48,9 @@ if (!fs.existsSync(SESSION_DIR)) {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
+// -------------------------------------------------------------------------
+// 3. PERSISTENCIA DE SESIÓN CON SUPABASE STORAGE
+// -------------------------------------------------------------------------
 async function descargarSesionSupabase() {
   try {
     const { data: files, error } = await supabase.storage.from(SUPABASE_BUCKET).list();
@@ -67,45 +74,57 @@ async function subirArchivoASupabase(fileName, filePath) {
     const fileBuffer = fs.readFileSync(filePath);
     await supabase.storage.from(SUPABASE_BUCKET).upload(fileName, fileBuffer, { upsert: true });
   } catch (err) {
-    logger.error({ err, fileName }, "Error al respaldar en Supabase");
+    logger.error({ err, fileName }, "Error al respaldar archivo en Supabase");
   }
 }
 
+// -------------------------------------------------------------------------
+// 4. CONSULTA DE CARTERA DIRECTA EN NEON POSTGRESQL
+// -------------------------------------------------------------------------
 async function consultarCarteraPorTelefono(telefonoLimpio) {
   const digitos = telefonoLimpio.replace(/\D/g, "");
-  console.log(`🔍 [DIAGNÓSTICO] Teléfono entrante crudo: ${telefonoLimpio} | Solo dígitos: ${digitos}`);
+  console.log(`🔍 [BOT] Evaluando número entrante: '${telefonoLimpio}' -> Dígitos: '${digitos}'`);
 
-  if (digitos.length < 8) {
-    console.log("⚠️ [DIAGNÓSTICO] El número tiene menos de 8 dígitos.");
+  if (!digitos || digitos.length < 7) {
+    console.log("⚠️ [BOT] Número muy corto o inválido.");
     return null;
   }
-  
+
   const ultimos8 = digitos.slice(-8);
-  console.log(`🔍 [DIAGNÓSTICO] Buscando en Neon registros que terminen en: ${ultimos8}`);
+  const ultimos7 = digitos.slice(-7);
+
+  console.log(`🔍 [BOT] Buscando en Neon coincidencias para: ${digitos} (o terminados en ${ultimos8})`);
 
   const query = `
     SELECT doctor_nombre, trato, saldo_pendiente, telefono
     FROM cuentas_doctores
-    WHERE REPLACE(REPLACE(REPLACE(COALESCE(telefono, ''), ' ', ''), '-', ''), '+', '') LIKE $1
+    WHERE 
+      REGEXP_REPLACE(COALESCE(telefono, ''), '[^0-9]', '', 'g') LIKE $1
+      OR REGEXP_REPLACE(COALESCE(telefono, ''), '[^0-9]', '', 'g') LIKE $2
+      OR REGEXP_REPLACE(COALESCE(telefono, ''), '[^0-9]', '', 'g') = $3
     ORDER BY id DESC
     LIMIT 1;
   `;
+  const params = [`%${ultimos8}`, `%${ultimos7}`, digitos];
 
   try {
-    const res = await pool.query(query, [`%${ultimos8}`]);
+    const res = await pool.query(query, params);
     if (res.rows.length > 0) {
-      console.log(`✅ [DIAGNÓSTICO] Doctor encontrado: ${res.rows[0].doctor_nombre} (Saldo: ${res.rows[0].saldo_pendiente})`);
+      console.log(`✅ [BOT] Registro encontrado en BD: ${res.rows[0].doctor_nombre} | Saldo: ${res.rows[0].saldo_pendiente}`);
       return res.rows[0];
     } else {
-      console.log(`❌ [DIAGNÓSTICO] No hubo coincidencias en cuentas_doctores para los dígitos: ${ultimos8}`);
+      console.log(`❌ [BOT] Sin coincidencias en cuentas_doctores.`);
       return null;
     }
   } catch (err) {
-    console.error("❌ [DIAGNÓSTICO] Error ejecutando query SQL en Neon:", err.message);
+    console.error("❌ [BOT] Error SQL en Neon:", err.message);
     return null;
   }
 }
 
+// -------------------------------------------------------------------------
+// 5. INICIALIZACIÓN Y GESTIÓN DE MENSAJES DE WHATSAPP
+// -------------------------------------------------------------------------
 async function iniciarBot() {
   await descargarSesionSupabase();
 
@@ -120,7 +139,6 @@ async function iniciarBot() {
     defaultQueryTimeoutMs: 60000
   });
 
-  // Si no está registrado y definiste el teléfono, generar Pairing Code
   if (!sock.authState.creds.registered && PHONE_NUMBER) {
     setTimeout(async () => {
       try {
@@ -164,7 +182,7 @@ async function iniciarBot() {
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
       const remoteJid = msg.key.remoteJid || "";
-      if (remoteJid.endsWith("@g.us")) continue;
+      if (remoteJid.endsWith("@g.us")) continue; // Ignorar grupos
 
       const texto = (
         msg.message.conversation ||
@@ -175,48 +193,79 @@ async function iniciarBot() {
 
       if (!texto) continue;
 
+      // Resolver teléfono real evitando LIDs (@lid)
       let telefonoReal = "";
       if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes("@s.whatsapp.net")) {
         telefonoReal = msg.key.remoteJidAlt.split("@")[0];
       } else if (remoteJid.endsWith("@s.whatsapp.net")) {
         telefonoReal = remoteJid.split("@")[0];
-      } else {
+      }
+
+      if (!telefonoReal && sock.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+          const pn = await sock.signalRepository.lidMapping.getPNForLID(remoteJid);
+          if (pn) telefonoReal = pn.split("@")[0];
+        } catch (_) {}
+      }
+
+      if (!telefonoReal) {
         telefonoReal = remoteJid.split("@")[0];
       }
 
       try {
-        if (/SALDO|DEUDA|CUENTA/.test(texto)) {
+        // 1. CONSULTA DE SALDO / DEUDA / ESTADO DE CUENTA
+        if (/SALDO|DEUDA|CUENTA|ESTADO/.test(texto)) {
           const cuenta = await consultarCarteraPorTelefono(telefonoReal);
+
           if (!cuenta) {
             await sock.sendMessage(remoteJid, {
-              text: "Estimado/a Doctor/a, no tenemos registrado su número en nuestro sistema de cartera contable.\n\nPor favor, comuníquese directamente con nuestro asesor comercial Michael."
+              text: "Estimado/a Doctor/a:\n\nNo registramos una cuenta vinculada a este número de contacto en nuestro sistema de cartera.\n\nPor favor, envíenos sus nombres completos o su número de identificación para que el área de atención al cliente pueda asistirle formalmente."
             });
             continue;
           }
+
           const trato = cuenta.trato || "Dr./Dra.";
           const nombre = cuenta.doctor_nombre || "";
           const saldo = parseFloat(cuenta.saldo_pendiente || 0);
 
           if (saldo > 0) {
             await sock.sendMessage(remoteJid, {
-              text: `Estimado/a ${trato} ${nombre}:\n\nSu saldo pendiente actual es de *$${saldo.toFixed(2)}*.\n\nSi ya realizó su abono, compártanos el comprobante por este medio. ¡Muchas gracias!`
+              text: `Estimado/a ${trato} ${nombre}:\n\nLe informamos que su saldo pendiente actual es de *$${saldo.toFixed(2)}*.\n\nSi ya realizó su transferencia o depósito, por favor adjunte su comprobante por este medio para registrar su conciliación. ¡Agradecemos su puntualidad y confianza en Mobadent!`
             });
           } else {
             await sock.sendMessage(remoteJid, {
-              text: `Estimado/a ${trato} ${nombre}:\n\n¡Le felicitamos! Su cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\nGracias por su confianza con Mobadent.`
+              text: `Estimado/a ${trato} ${nombre}:\n\nNos complace informarle que su cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\nMuchas gracias por su preferencia comercial con Mobadent.`
             });
           }
-        } else if (/BANCO|TRANSFERENCIA|PAGO/.test(texto)) {
+        } 
+        // 2. DATOS BANCARIOS OFICIALES
+        else if (/BANCO|TRANSFERENCIA|PAGO|DATOS/.test(texto)) {
           await sock.sendMessage(remoteJid, {
-            text: "🏦 *DATOS BANCARIOS OFICIALES - MOBADENT*\n\n• *Banco:* Banco Pichincha\n• *Tipo de Cuenta:* Corriente\n• *Número:* 2100XXXXXX\n• *Titular:* MOBADENT S.A.S.\n• *RUC:* 099XXXXXXXX001\n• *Correo:* pagos@mobadent.ec"
+            text: "🏦 *DATOS BANCARIOS OFICIALES - MOBADENT S.A.S.*\n\n" +
+                  "• *Institución Financiera:* Banco Pichincha\n" +
+                  "• *Tipo de Cuenta:* Corriente\n" +
+                  "• *Número de Cuenta:* 2100XXXXXX\n" +
+                  "• *Titular:* MOBADENT S.A.S.\n" +
+                  "• *RUC:* 099XXXXXXXX001\n" +
+                  "• *Correo de Facturación/Cobranza:* pagos@mobadent.ec\n\n" +
+                  "📌 *Nota:* Una vez realizada la operación, envíenos el comprobante emitido por el banco para validar su crédito contable."
           });
-        } else if (/MENU|HOLA|AYUDA/.test(texto)) {
+        } 
+        // 3. MENÚ PRINCIPAL / BIENVENIDA
+        else if (/MENU|HOLA|BUENAS|INICIO|OPCIONES/.test(texto)) {
           await sock.sendMessage(remoteJid, {
-            text: "👋 *Bienvenido a Mobadent*\n\nEscriba una opción:\n👉 *SALDO*: Consultar su deuda.\n👉 *BANCO*: Ver datos de transferencia.\n👉 *ASESOR*: Hablar con Michael."
+            text: "👋 *Atención al Cliente - Mobadent*\n\n" +
+                  "Por favor, seleccione o escriba una de las siguientes opciones:\n\n" +
+                  "👉 *SALDO*: Consulta de balance contable y estado de cartera.\n" +
+                  "👉 *BANCO*: Información de cuentas oficiales para pagos.\n" +
+                  "👉 *SOPORTE*: Contactar con el área de atención y cobranza."
           });
-        } else if (/MICHAEL|ASESOR|HUMANO/.test(texto)) {
+        } 
+        // 4. ATENCIÓN AL CLIENTE / SOPORTE ADMINISTRATIVO
+        else if (/SOPORTE|ATENCION|AYUDA|HUMANO|CONTACTO/.test(texto)) {
           await sock.sendMessage(remoteJid, {
-            text: "🔔 Hemos notificado a su asesor comercial *Michael*. En breve revisará este chat."
+            text: "🛎️ *Atención al Cliente - Mobadent*\n\n" +
+                  "Hemos registrado su solicitud. Un representante del departamento administrativo revisará este canal para brindarle atención personalizada a la brevedad posible."
           });
         }
       } catch (err) {
@@ -225,6 +274,5 @@ async function iniciarBot() {
     }
   });
 }
-
 
 iniciarBot().catch(console.error);
