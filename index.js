@@ -9,11 +9,23 @@ import qrcode from "qrcode-terminal";
 import pino from "pino";
 import fs from "fs";
 import path from "path";
+import http from "http";
 
 const logger = pino({ level: "info" });
 
 // -------------------------------------------------------------------------
-// 1. CONFIGURACIÓN DE VARIABLES DE ENTORNO
+// 1. PUERTO HTTP OBLIGATORIO PARA RENDER WEB SERVICE
+// -------------------------------------------------------------------------
+const PORT = process.env.PORT || 8080;
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("Mobadent Bot Cloud 24/7 en línea.");
+}).listen(PORT, () => {
+  console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT} para Render.`);
+});
+
+// -------------------------------------------------------------------------
+// 2. VARIABLES DE ENTORNO
 // -------------------------------------------------------------------------
 const DATABASE_URL = process.env.DATABASE_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -26,70 +38,44 @@ if (!DATABASE_URL || !SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-// Cliente Supabase y Pool Neon
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const pool = new pg.Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// -------------------------------------------------------------------------
-// 2. SINCRONIZACIÓN DE SESIÓN CON SUPABASE STORAGE
-// -------------------------------------------------------------------------
 if (!fs.existsSync(SESSION_DIR)) {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
 async function descargarSesionSupabase() {
   try {
-    const { data: files, error } = await supabase.storage
-      .from(SUPABASE_BUCKET)
-      .list();
+    const { data: files, error } = await supabase.storage.from(SUPABASE_BUCKET).list();
+    if (error || !files || files.length === 0) return;
 
-    if (error) {
-      logger.warn({ err: error.message }, "Aviso al listar bucket en Supabase");
-      return;
-    }
-
-    if (!files || files.length === 0) {
-      logger.info("ℹ️ No hay sesión previa en Supabase. Se requerirá escaneo de QR inicial.");
-      return;
-    }
-
-    logger.info(`🔄 Descargando ${files.length} archivos de sesión desde Supabase...`);
     for (const f of files) {
       if (f.name === ".emptyFolderPlaceholder") continue;
-      const { data, error: downErr } = await supabase.storage
-        .from(SUPABASE_BUCKET)
-        .download(f.name);
-
+      const { data, error: downErr } = await supabase.storage.from(SUPABASE_BUCKET).download(f.name);
       if (!downErr && data) {
-        const buffer = Buffer.from(await data.arrayBuffer());
-        fs.writeFileSync(path.join(SESSION_DIR, f.name), buffer);
+        fs.writeFileSync(path.join(SESSION_DIR, f.name), Buffer.from(await data.arrayBuffer()));
       }
     }
-    logger.info("✅ Sesión sincronizada desde Supabase con éxito.");
+    logger.info("✅ Sesión sincronizada desde Supabase.");
   } catch (err) {
-    logger.error({ err }, "Error descargando sesión de Supabase");
+    logger.error({ err }, "Aviso sincronizando sesión inicial");
   }
 }
 
 async function subirArchivoASupabase(fileName, filePath) {
   try {
     const fileBuffer = fs.readFileSync(filePath);
-    await supabase.storage
-      .from(SUPABASE_BUCKET)
-      .upload(fileName, fileBuffer, { upsert: true });
+    await supabase.storage.from(SUPABASE_BUCKET).upload(fileName, fileBuffer, { upsert: true });
   } catch (err) {
-    logger.error({ err, fileName }, "Error al respaldar archivo en Supabase");
+    logger.error({ err, fileName }, "Error al respaldar en Supabase");
   }
 }
 
-// -------------------------------------------------------------------------
-// 3. CONSULTAS SQL A NEON (CARTERA DOCTORES)
-// -------------------------------------------------------------------------
 async function consultarCarteraPorTelefono(telefonoLimpio) {
-  // Extraer los últimos 8 dígitos numéricos para tolerar formatos +593, 09, etc.
   const digitos = telefonoLimpio.replace(/\D/g, "");
   if (digitos.length < 8) return null;
   const ultimos8 = digitos.slice(-8);
@@ -101,29 +87,20 @@ async function consultarCarteraPorTelefono(telefonoLimpio) {
     ORDER BY id DESC
     LIMIT 1;
   `;
-  const params = [`%${ultimos8}`];
-
   try {
-    const res = await pool.query(query, params);
-    if (res.rows.length > 0) {
-      return res.rows[0];
-    }
-    return null;
+    const res = await pool.query(query, [`%${ultimos8}`]);
+    return res.rows.length > 0 ? res.rows[0] : null;
   } catch (err) {
-    logger.error({ err }, "Error ejecutando consulta de cartera en Neon");
+    logger.error({ err }, "Error consultando cartera en Neon");
     return null;
   }
 }
 
-// -------------------------------------------------------------------------
-// 4. INICIALIZACIÓN DEL BOT BAILEYS
-// -------------------------------------------------------------------------
 async function iniciarBot() {
   await descargarSesionSupabase();
 
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version, isLatest } = await fetchLatestBaileysVersion();
-  logger.info(`Iniciando Baileys v${version.join(".")} (Última versión: ${isLatest})`);
+  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
@@ -133,7 +110,6 @@ async function iniciarBot() {
     defaultQueryTimeoutMs: 60000
   });
 
-  // Guardar credenciales y sincronizar con Supabase
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     try {
@@ -141,134 +117,96 @@ async function iniciarBot() {
       for (const archivo of archivos) {
         await subirArchivoASupabase(archivo, path.join(SESSION_DIR, archivo));
       }
-    } catch (e) {
-      logger.error({ err: e }, "Fallo al sincronizar credenciales actualizadas a Supabase");
-    }
+    } catch (_) {}
   });
 
-  // Estado de la conexión
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       console.log("\n=======================================================");
-      console.log("📲 ESCANEA ESTE CÓDIGO QR EN WHATSAPP (LOGS DE LA NUBE):");
+      console.log("📲 ESCANEA ESTE CÓDIGO QR:");
       console.log("=======================================================\n");
-      qrcode.generate(qr, { small: true });
+      // Imprimir sin reducir margen para que la cámara lo reconozca
+      qrcode.generate(qr, { small: false });
     }
 
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const debeReconectar = statusCode !== DisconnectReason.loggedOut;
-      logger.warn(`Conexión cerrada. Código: ${statusCode}. Reconectando: ${debeReconectar}`);
-
-      if (debeReconectar) {
+      if (statusCode !== DisconnectReason.loggedOut) {
         setTimeout(iniciarBot, 5000);
-      } else {
-        logger.error("Sesión cerrada permanentemente (Logged Out). Limpie credenciales y reescanee.");
       }
     } else if (connection === "open") {
-      logger.info("🟢 Mobadent Bot Cloud CONECTADO y activo 24/7.");
+      console.log("\n🟢 Mobadent Bot Cloud CONECTADO y activo 24/7.\n");
     }
   });
 
-  // Escucha de mensajes entrantes
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      // Ignorar mensajes enviados por el propio bot o sin contenido
       if (!msg.message || msg.key.fromMe) continue;
-
       const remoteJid = msg.key.remoteJid || "";
-      if (remoteJid.endsWith("@g.us")) continue; // Ignorar grupos
+      if (remoteJid.endsWith("@g.us")) continue;
 
-      // 1. Extraer texto del mensaje
-      const textoMensaje = (
+      const texto = (
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         msg.message.imageMessage?.caption ||
         ""
       ).trim().toUpperCase();
 
-      if (!textoMensaje) continue;
+      if (!texto) continue;
 
-      // 2. Resolver el teléfono real evitando LIDs
       let telefonoReal = "";
       if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes("@s.whatsapp.net")) {
         telefonoReal = msg.key.remoteJidAlt.split("@")[0];
       } else if (remoteJid.endsWith("@s.whatsapp.net")) {
         telefonoReal = remoteJid.split("@")[0];
-      } else if (sock.signalRepository?.lidMapping?.getPNForLID) {
-        try {
-          const pn = await sock.signalRepository.lidMapping.getPNForLID(remoteJid);
-          if (pn) telefonoReal = pn.split("@")[0];
-        } catch (_) {}
-      }
-
-      if (!telefonoReal && remoteJid.includes("@")) {
+      } else {
         telefonoReal = remoteJid.split("@")[0];
       }
 
-      // 3. Evaluar palabras clave y despachar respuestas
       try {
-        if (/SALDO|DEUDA|CUENTA/.test(textoMensaje)) {
+        if (/SALDO|DEUDA|CUENTA/.test(texto)) {
           const cuenta = await consultarCarteraPorTelefono(telefonoReal);
-
           if (!cuenta) {
             await sock.sendMessage(remoteJid, {
-              text: "Estimado/a Doctor/a, no tenemos registrado su número en nuestro sistema de cartera contable.\n\nPor favor, comuníquese directamente con nuestro asesor comercial Michael para registrar su ficha o verificar su estado."
+              text: "Estimado/a Doctor/a, no tenemos registrado su número en nuestro sistema de cartera contable.\n\nPor favor, comuníquese directamente con nuestro asesor comercial Michael."
             });
             continue;
           }
-
           const trato = cuenta.trato || "Dr./Dra.";
           const nombre = cuenta.doctor_nombre || "";
           const saldo = parseFloat(cuenta.saldo_pendiente || 0);
 
           if (saldo > 0) {
             await sock.sendMessage(remoteJid, {
-              text: `Estimado/a ${trato} ${nombre}:\n\nSu saldo pendiente actual es de *$${saldo.toFixed(2)}*.\n\nSi ya realizó su abono o cancelación, por favor compártanos el comprobante por este medio para conciliarlo en el sistema. ¡Muchas gracias por su preferencia!`
+              text: `Estimado/a ${trato} ${nombre}:\n\nSu saldo pendiente actual es de *$${saldo.toFixed(2)}*.\n\nSi ya realizó su abono, compártanos el comprobante por este medio. ¡Muchas gracias!`
             });
           } else {
             await sock.sendMessage(remoteJid, {
-              text: `Estimado/a ${trato} ${nombre}:\n\n¡Le felicitamos! Su cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\nGracias por su confianza y puntualidad con Mobadent.`
+              text: `Estimado/a ${trato} ${nombre}:\n\n¡Le felicitamos! Su cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\nGracias por su confianza con Mobadent.`
             });
           }
-        } 
-        else if (/BANCO|TRANSFERENCIA|PAGO/.test(textoMensaje)) {
+        } else if (/BANCO|TRANSFERENCIA|PAGO/.test(texto)) {
           await sock.sendMessage(remoteJid, {
-            text: "🏦 *DATOS BANCARIOS OFICIALES - MOBADENT*\n\n" +
-                  "• *Banco:* Banco Pichincha\n" +
-                  "• *Tipo de Cuenta:* Corriente\n" +
-                  "• *Número de Cuenta:* 2100XXXXXX\n" +
-                  "• *Titular:* MOBADENT S.A.S.\n" +
-                  "• *RUC:* 099XXXXXXXX001\n" +
-                  "• *Correo de soporte:* pagos@mobadent.ec\n\n" +
-                  "Una vez realizada la transferencia, envíenos el comprobante por este chat para acreditarlo a su cuenta."
+            text: "🏦 *DATOS BANCARIOS OFICIALES - MOBADENT*\n\n• *Banco:* Banco Pichincha\n• *Tipo de Cuenta:* Corriente\n• *Número:* 2100XXXXXX\n• *Titular:* MOBADENT S.A.S.\n• *RUC:* 099XXXXXXXX001\n• *Correo:* pagos@mobadent.ec"
           });
-        } 
-        else if (/MENU|HOLA|AYUDA/.test(textoMensaje)) {
+        } else if (/MENU|HOLA|AYUDA/.test(texto)) {
           await sock.sendMessage(remoteJid, {
-            text: "👋 *Bienvenido al Asistente Automatizado de Mobadent*\n\n" +
-                  "Escriba una de las siguientes opciones para ayudarle de inmediato:\n\n" +
-                  "👉 *SALDO*: Consultar su estado de cuenta y balance pendiente.\n" +
-                  "👉 *BANCO*: Ver los datos de cuenta para pagos y transferencias.\n" +
-                  "👉 *ASESOR*: Solicitar atención personalizada con Michael."
+            text: "👋 *Bienvenido a Mobadent*\n\nEscriba una opción:\n👉 *SALDO*: Consultar su deuda.\n👉 *BANCO*: Ver datos de transferencia.\n👉 *ASESOR*: Hablar con Michael."
           });
-        } 
-        else if (/MICHAEL|ASESOR|HUMANO/.test(textoMensaje)) {
+        } else if (/MICHAEL|ASESOR|HUMANO/.test(texto)) {
           await sock.sendMessage(remoteJid, {
-            text: "🔔 Hemos notificado a su asesor comercial *Michael*. En breve revisará este chat para atenderle de manera directa. Si es urgente, puede marcarle a su extensión móvil habitual."
+            text: "🔔 Hemos notificado a su asesor comercial *Michael*. En breve revisará este chat."
           });
         }
-      } catch (sendErr) {
-        logger.error({ err: sendErr, remoteJid }, "Error respondiendo mensaje");
+      } catch (err) {
+        logger.error({ err }, "Error procesando mensaje");
       }
     }
   });
 }
 
-iniciarBot().catch((err) => {
-  logger.fatal({ err }, "Error crítico en proceso principal");
-});
+iniciarBot().catch(console.error);
