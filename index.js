@@ -73,21 +73,35 @@ async function subirArchivoASupabase(fileName, filePath) {
 
 async function consultarCarteraPorTelefono(telefonoLimpio) {
   const digitos = telefonoLimpio.replace(/\D/g, "");
-  if (digitos.length < 8) return null;
+  console.log(`🔍 [DIAGNÓSTICO] Teléfono entrante crudo: ${telefonoLimpio} | Solo dígitos: ${digitos}`);
+
+  if (digitos.length < 8) {
+    console.log("⚠️ [DIAGNÓSTICO] El número tiene menos de 8 dígitos.");
+    return null;
+  }
+  
   const ultimos8 = digitos.slice(-8);
+  console.log(`🔍 [DIAGNÓSTICO] Buscando en Neon registros que terminen en: ${ultimos8}`);
 
   const query = `
-    SELECT doctor_nombre, trato, saldo_pendiente
+    SELECT doctor_nombre, trato, saldo_pendiente, telefono
     FROM cuentas_doctores
-    WHERE REPLACE(REPLACE(REPLACE(telefono, ' ', ''), '-', ''), '+', '') LIKE $1
+    WHERE REPLACE(REPLACE(REPLACE(COALESCE(telefono, ''), ' ', ''), '-', ''), '+', '') LIKE $1
     ORDER BY id DESC
     LIMIT 1;
   `;
+
   try {
     const res = await pool.query(query, [`%${ultimos8}`]);
-    return res.rows.length > 0 ? res.rows[0] : null;
+    if (res.rows.length > 0) {
+      console.log(`✅ [DIAGNÓSTICO] Doctor encontrado: ${res.rows[0].doctor_nombre} (Saldo: ${res.rows[0].saldo_pendiente})`);
+      return res.rows[0];
+    } else {
+      console.log(`❌ [DIAGNÓSTICO] No hubo coincidencias en cuentas_doctores para los dígitos: ${ultimos8}`);
+      return null;
+    }
   } catch (err) {
-    logger.error({ err }, "Error consultando cartera en Neon");
+    console.error("❌ [DIAGNÓSTICO] Error ejecutando query SQL en Neon:", err.message);
     return null;
   }
 }
