@@ -12,7 +12,9 @@ import http from "http";
 
 const logger = pino({ level: "info" });
 
-// 1. SERVIDOR HTTP PARA QUE RENDER NO ABORTE EL SERVICIO WEB
+// -------------------------------------------------------------------------
+// 1. SERVIDOR HTTP OBLIGATORIO PARA RENDER
+// -------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -21,7 +23,9 @@ http.createServer((req, res) => {
   console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT}`);
 });
 
-// 2. VARIABLES DE ENTORNO
+// -------------------------------------------------------------------------
+// 2. CONFIGURACIÓN Y VARIABLES DE ENTORNO
+// -------------------------------------------------------------------------
 const DATABASE_URL = process.env.DATABASE_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -44,11 +48,27 @@ if (!fs.existsSync(SESSION_DIR)) {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
+// -------------------------------------------------------------------------
+// 3. PERSISTENCIA ROBUSTA DE SESIÓN CON SUPABASE STORAGE
+// -------------------------------------------------------------------------
 async function descargarSesionSupabase() {
+  console.log("⬇️ Verificando y descargando sesión desde Supabase...");
   try {
-    const { data: files, error } = await supabase.storage.from(SUPABASE_BUCKET).list();
-    if (error || !files || files.length === 0) return;
+    const { data: files, error } = await supabase.storage
+      .from(SUPABASE_BUCKET)
+      .list("", { limit: 1000, sortBy: { column: "name", order: "asc" } });
 
+    if (error) {
+      console.error("❌ Error listando archivos de sesión en Supabase:", error.message);
+      return;
+    }
+
+    if (!files || files.length === 0) {
+      console.log("ℹ️ No hay sesión previa almacenada en Supabase.");
+      return;
+    }
+
+    console.log(`📦 Descargando ${files.length} archivos de sesión...`);
     for (const f of files) {
       if (f.name === ".emptyFolderPlaceholder") continue;
       const { data, error: downErr } = await supabase.storage.from(SUPABASE_BUCKET).download(f.name);
@@ -56,22 +76,31 @@ async function descargarSesionSupabase() {
         fs.writeFileSync(path.join(SESSION_DIR, f.name), Buffer.from(await data.arrayBuffer()));
       }
     }
-    console.log("✅ Sesión existente sincronizada desde Supabase.");
+    console.log("✅ Sesión descargada y lista.");
   } catch (err) {
-    console.error("Aviso sincronizando sesión inicial:", err.message);
+    console.error("⚠️ Error durante descarga inicial:", err.message);
   }
 }
 
-async function subirArchivoASupabase(fileName, filePath) {
+async function sincronizarArchivosASupabase() {
   try {
-    const fileBuffer = fs.readFileSync(filePath);
-    await supabase.storage.from(SUPABASE_BUCKET).upload(fileName, fileBuffer, { upsert: true });
+    if (!fs.existsSync(SESSION_DIR)) return;
+    const archivos = fs.readdirSync(SESSION_DIR);
+    for (const archivo of archivos) {
+      const rutaCompleta = path.join(SESSION_DIR, archivo);
+      if (fs.lstatSync(rutaCompleta).isFile()) {
+        const fileBuffer = fs.readFileSync(rutaCompleta);
+        await supabase.storage.from(SUPABASE_BUCKET).upload(archivo, fileBuffer, { upsert: true });
+      }
+    }
   } catch (err) {
-    console.error(`Error al respaldar ${fileName} en Supabase:`, err.message);
+    console.error("⚠️ Error sincronizando sesión a Supabase:", err.message);
   }
 }
 
-// 3. CONSULTA DE CARTERA COMPROBADA CON TU PRUEBA PYTHON
+// -------------------------------------------------------------------------
+// 4. CONSULTA DE CARTERA DIRECTA EN NEON
+// -------------------------------------------------------------------------
 async function consultarCarteraPorTelefono(telefonoLimpio) {
   const digitos = telefonoLimpio.replace(/\D/g, "");
   console.log(`🔍 [BOT] Evaluando número entrante: "${telefonoLimpio}" -> Dígitos: "${digitos}"`);
@@ -98,7 +127,7 @@ async function consultarCarteraPorTelefono(telefonoLimpio) {
   try {
     const res = await pool.query(query, params);
     if (res.rows.length > 0) {
-      console.log(`✅ [BOT] Encontrado: ${res.rows[0].doctor_nombre} | Saldo: ${res.rows[0].saldo_pendiente}`);
+      console.log(`✅ [BOT] Doctor encontrado: ${res.rows[0].doctor_nombre} | Saldo: ${res.rows[0].saldo_pendiente}`);
       return res.rows[0];
     }
     return null;
@@ -108,7 +137,9 @@ async function consultarCarteraPorTelefono(telefonoLimpio) {
   }
 }
 
-// 4. INICIALIZAR BAILEYS Y PROCESAR MENSAJES
+// -------------------------------------------------------------------------
+// 5. INICIALIZACIÓN DEL BOT
+// -------------------------------------------------------------------------
 async function iniciarBot() {
   await descargarSesionSupabase();
 
@@ -123,38 +154,47 @@ async function iniciarBot() {
     defaultQueryTimeoutMs: 60000
   });
 
+  // Guardar credenciales de inmediato cuando Baileys las actualice
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();
+    await sincronizarArchivosASupabase();
+  });
+
+  // Sincronizador periódico de respaldo cada 30 segundos para llaves nuevas
+  const syncInterval = setInterval(async () => {
+    if (sock.authState?.creds?.registered) {
+      await sincronizarArchivosASupabase();
+    }
+  }, 30000);
+
+  // Solo si NO está registrado en absoluto se pide el Pairing Code
   if (!sock.authState.creds.registered && PHONE_NUMBER) {
     setTimeout(async () => {
       try {
         const cleanNumber = PHONE_NUMBER.replace(/\D/g, "");
         const code = await sock.requestPairingCode(cleanNumber);
+        console.log("\n=======================================================");
         console.log(`📲 CÓDIGO DE VINCULACIÓN: ${code}`);
+        console.log("=======================================================\n");
       } catch (err) {
         console.error("Error solicitando Pairing Code:", err);
       }
     }, 4000);
   }
 
-  sock.ev.on("creds.update", async () => {
-    await saveCreds();
-    try {
-      const archivos = fs.readdirSync(SESSION_DIR);
-      for (const archivo of archivos) {
-        await subirArchivoASupabase(archivo, path.join(SESSION_DIR, archivo));
-      }
-    } catch (_) {}
-  });
-
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect } = update;
 
     if (connection === "close") {
+      clearInterval(syncInterval);
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       if (statusCode !== DisconnectReason.loggedOut) {
         setTimeout(iniciarBot, 5000);
       }
     } else if (connection === "open") {
       console.log("\n🟢 Mobadent Bot Cloud CONECTADO y activo 24/7.\n");
+      // Sincronizar inmediatamente tras conexión exitosa
+      sincronizarArchivosASupabase();
     }
   });
 
@@ -175,7 +215,7 @@ async function iniciarBot() {
 
       if (!texto) continue;
 
-      // RESOLUCIÓN REAL DE TELÉFONO EVITANDO EL IDENTIFICADOR LID
+      // Extracción de número real prioritaria sobre LIDs
       let telefonoReal = "";
 
       if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes("@s.whatsapp.net")) {
@@ -188,7 +228,6 @@ async function iniciarBot() {
         telefonoReal = remoteJid.split("@")[0];
       }
 
-      // Si aún sigue como @lid, resolver con el repositorio interno
       if ((!telefonoReal || telefonoReal.length > 15) && remoteJid.includes("@lid") && sock.signalRepository?.lidMapping?.getPNForLID) {
         try {
           const pn = await sock.signalRepository.lidMapping.getPNForLID(remoteJid);
@@ -196,13 +235,11 @@ async function iniciarBot() {
         } catch (_) {}
       }
 
-      // Fallback
       if (!telefonoReal) {
         telefonoReal = remoteJid.split("@")[0];
       }
 
       try {
-        // 1. CONSULTA DE SALDO / DEUDA / CARTERA
         if (/SALDO|DEUDA|CUENTA|ESTADO/.test(texto)) {
           const cuenta = await consultarCarteraPorTelefono(telefonoReal);
 
@@ -226,9 +263,7 @@ async function iniciarBot() {
               text: `Estimado/a ${trato} ${nombre}:\n\nNos complace informarle que su cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\nMuchas gracias por su preferencia comercial con Mobadent.`
             });
           }
-        } 
-        // 2. DATOS BANCARIOS OFICIALES
-        else if (/BANCO|TRANSFERENCIA|PAGO|DATOS/.test(texto)) {
+        } else if (/BANCO|TRANSFERENCIA|PAGO|DATOS/.test(texto)) {
           await sock.sendMessage(remoteJid, {
             text: "🏦 *DATOS BANCARIOS OFICIALES - MOBADENT S.A.S.*\n\n" +
                   "• *Institución Financiera:* Banco Pichincha\n" +
@@ -239,9 +274,7 @@ async function iniciarBot() {
                   "• *Correo de Facturación/Cobranza:* pagos@mobadent.ec\n\n" +
                   "📌 *Nota:* Una vez realizada la operación, envíenos el comprobante emitido por el banco para validar su crédito contable."
           });
-        } 
-        // 3. MENÚ PRINCIPAL
-        else if (/MENU|HOLA|BUENAS|INICIO|OPCIONES/.test(texto)) {
+        } else if (/MENU|HOLA|BUENAS|INICIO|OPCIONES/.test(texto)) {
           await sock.sendMessage(remoteJid, {
             text: "👋 *Atención al Cliente - Mobadent*\n\n" +
                   "Por favor, seleccione o escriba una de las siguientes opciones:\n\n" +
@@ -249,20 +282,17 @@ async function iniciarBot() {
                   "👉 *BANCO*: Información de cuentas oficiales para pagos.\n" +
                   "👉 *SOPORTE*: Contactar con el área de atención y cobranza."
           });
-        } 
-        // 4. ATENCIÓN Y CONTACTO
-        else if (/SOPORTE|ATENCION|AYUDA|CONTACTO/.test(texto)) {
+        } else if (/SOPORTE|ATENCION|AYUDA|CONTACTO/.test(texto)) {
           await sock.sendMessage(remoteJid, {
             text: "🛎️ *Atención al Cliente - Mobadent*\n\n" +
                   "Hemos registrado su solicitud. Un representante del departamento administrativo revisará este canal para brindarle atención personalizada a la brevedad posible."
           });
         }
       } catch (err) {
-        console.error("Error respondiendo mensaje:", err.message);
+        console.error("Error procesando mensaje:", err.message);
       }
     }
   });
 }
-
 
 iniciarBot().catch(console.error);
