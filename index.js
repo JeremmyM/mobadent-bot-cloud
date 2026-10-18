@@ -5,7 +5,6 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { createClient } from "@supabase/supabase-js";
 import pg from "pg";
-import qrcode from "qrcode-terminal";
 import pino from "pino";
 import fs from "fs";
 import path from "path";
@@ -13,28 +12,25 @@ import http from "http";
 
 const logger = pino({ level: "info" });
 
-// -------------------------------------------------------------------------
-// 1. PUERTO HTTP OBLIGATORIO PARA RENDER WEB SERVICE
-// -------------------------------------------------------------------------
+// 1. Mantener puerto HTTP activo para que Render Web Service no aborte
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
   res.end("Mobadent Bot Cloud 24/7 en línea.");
 }).listen(PORT, () => {
-  console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT} para Render.`);
+  console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT}`);
 });
 
-// -------------------------------------------------------------------------
-// 2. VARIABLES DE ENTORNO
-// -------------------------------------------------------------------------
+// 2. Variables de entorno
 const DATABASE_URL = process.env.DATABASE_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const PHONE_NUMBER = process.env.WHATSAPP_PHONE; // Número con prefijo (Ej: 5939XXXXXXXX)
 const SUPABASE_BUCKET = "whatsapp-session";
 const SESSION_DIR = path.resolve("./auth_session");
 
 if (!DATABASE_URL || !SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("❌ Faltan variables de entorno: DATABASE_URL, SUPABASE_URL o SUPABASE_KEY.");
+  console.error("❌ Faltan variables de entorno esenciales.");
   process.exit(1);
 }
 
@@ -60,7 +56,7 @@ async function descargarSesionSupabase() {
         fs.writeFileSync(path.join(SESSION_DIR, f.name), Buffer.from(await data.arrayBuffer()));
       }
     }
-    logger.info("✅ Sesión sincronizada desde Supabase.");
+    logger.info("✅ Sesión existente sincronizada desde Supabase.");
   } catch (err) {
     logger.error({ err }, "Aviso sincronizando sesión inicial");
   }
@@ -110,6 +106,21 @@ async function iniciarBot() {
     defaultQueryTimeoutMs: 60000
   });
 
+  // Si no está registrado y definiste el teléfono, generar Pairing Code
+  if (!sock.authState.creds.registered && PHONE_NUMBER) {
+    setTimeout(async () => {
+      try {
+        const cleanNumber = PHONE_NUMBER.replace(/\D/g, "");
+        const code = await sock.requestPairingCode(cleanNumber);
+        console.log("\n=======================================================");
+        console.log(`📲 CÓDIGO DE VINCULACIÓN DE WHATSAPP: ${code}`);
+        console.log("=======================================================\n");
+      } catch (err) {
+        console.error("Error solicitando Pairing Code:", err);
+      }
+    }, 4000);
+  }
+
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     try {
@@ -121,15 +132,7 @@ async function iniciarBot() {
   });
 
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log("\n=======================================================");
-      console.log("📲 ESCANEA ESTE CÓDIGO QR:");
-      console.log("=======================================================\n");
-      // Imprimir sin reducir margen para que la cámara lo reconozca
-      qrcode.generate(qr, { small: false });
-    }
+    const { connection, lastDisconnect } = update;
 
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
