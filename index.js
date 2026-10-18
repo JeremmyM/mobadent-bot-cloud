@@ -295,4 +295,7 @@ async function iniciarBot() {
   });
 }
 
+
+
+
 iniciarBot().catch(console.error);
