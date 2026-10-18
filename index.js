@@ -12,9 +12,7 @@ import http from "http";
 
 const logger = pino({ level: "info" });
 
-// -------------------------------------------------------------------------
-// 1. SERVIDOR HTTP OBLIGATORIO PARA RENDER WEB SERVICE
-// -------------------------------------------------------------------------
+// 1. SERVIDOR HTTP PARA QUE RENDER NO ABORTE EL SERVICIO WEB
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -23,9 +21,7 @@ http.createServer((req, res) => {
   console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT}`);
 });
 
-// -------------------------------------------------------------------------
-// 2. CONFIGURACIÓN Y VARIABLES DE ENTORNO
-// -------------------------------------------------------------------------
+// 2. VARIABLES DE ENTORNO
 const DATABASE_URL = process.env.DATABASE_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -34,7 +30,7 @@ const SUPABASE_BUCKET = "whatsapp-session";
 const SESSION_DIR = path.resolve("./auth_session");
 
 if (!DATABASE_URL || !SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("❌ Faltan variables de entorno esenciales: DATABASE_URL, SUPABASE_URL o SUPABASE_KEY.");
+  console.error("❌ Faltan variables de entorno esenciales.");
   process.exit(1);
 }
 
@@ -48,9 +44,6 @@ if (!fs.existsSync(SESSION_DIR)) {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
-// -------------------------------------------------------------------------
-// 3. PERSISTENCIA DE SESIÓN CON SUPABASE STORAGE
-// -------------------------------------------------------------------------
 async function descargarSesionSupabase() {
   try {
     const { data: files, error } = await supabase.storage.from(SUPABASE_BUCKET).list();
@@ -63,9 +56,9 @@ async function descargarSesionSupabase() {
         fs.writeFileSync(path.join(SESSION_DIR, f.name), Buffer.from(await data.arrayBuffer()));
       }
     }
-    logger.info("✅ Sesión existente sincronizada desde Supabase.");
+    console.log("✅ Sesión existente sincronizada desde Supabase.");
   } catch (err) {
-    logger.error({ err }, "Aviso sincronizando sesión inicial");
+    console.error("Aviso sincronizando sesión inicial:", err.message);
   }
 }
 
@@ -74,26 +67,21 @@ async function subirArchivoASupabase(fileName, filePath) {
     const fileBuffer = fs.readFileSync(filePath);
     await supabase.storage.from(SUPABASE_BUCKET).upload(fileName, fileBuffer, { upsert: true });
   } catch (err) {
-    logger.error({ err, fileName }, "Error al respaldar archivo en Supabase");
+    console.error(`Error al respaldar ${fileName} en Supabase:`, err.message);
   }
 }
 
-// -------------------------------------------------------------------------
-// 4. CONSULTA DE CARTERA DIRECTA EN NEON POSTGRESQL
-// -------------------------------------------------------------------------
+// 3. CONSULTA DE CARTERA COMPROBADA CON TU PRUEBA PYTHON
 async function consultarCarteraPorTelefono(telefonoLimpio) {
   const digitos = telefonoLimpio.replace(/\D/g, "");
-  console.log(`🔍 [BOT] Evaluando número entrante: '${telefonoLimpio}' -> Dígitos: '${digitos}'`);
+  console.log(`🔍 [BOT] Evaluando número entrante: "${telefonoLimpio}" -> Dígitos: "${digitos}"`);
 
   if (!digitos || digitos.length < 7) {
-    console.log("⚠️ [BOT] Número muy corto o inválido.");
     return null;
   }
 
   const ultimos8 = digitos.slice(-8);
   const ultimos7 = digitos.slice(-7);
-
-  console.log(`🔍 [BOT] Buscando en Neon coincidencias para: ${digitos} (o terminados en ${ultimos8})`);
 
   const query = `
     SELECT doctor_nombre, trato, saldo_pendiente, telefono
@@ -110,21 +98,17 @@ async function consultarCarteraPorTelefono(telefonoLimpio) {
   try {
     const res = await pool.query(query, params);
     if (res.rows.length > 0) {
-      console.log(`✅ [BOT] Registro encontrado en BD: ${res.rows[0].doctor_nombre} | Saldo: ${res.rows[0].saldo_pendiente}`);
+      console.log(`✅ [BOT] Encontrado: ${res.rows[0].doctor_nombre} | Saldo: ${res.rows[0].saldo_pendiente}`);
       return res.rows[0];
-    } else {
-      console.log(`❌ [BOT] Sin coincidencias en cuentas_doctores.`);
-      return null;
     }
+    return null;
   } catch (err) {
     console.error("❌ [BOT] Error SQL en Neon:", err.message);
     return null;
   }
 }
 
-// -------------------------------------------------------------------------
-// 5. INICIALIZACIÓN Y GESTIÓN DE MENSAJES DE WHATSAPP
-// -------------------------------------------------------------------------
+// 4. INICIALIZAR BAILEYS Y PROCESAR MENSAJES
 async function iniciarBot() {
   await descargarSesionSupabase();
 
@@ -144,9 +128,7 @@ async function iniciarBot() {
       try {
         const cleanNumber = PHONE_NUMBER.replace(/\D/g, "");
         const code = await sock.requestPairingCode(cleanNumber);
-        console.log("\n=======================================================");
-        console.log(`📲 CÓDIGO DE VINCULACIÓN DE WHATSAPP: ${code}`);
-        console.log("=======================================================\n");
+        console.log(`📲 CÓDIGO DE VINCULACIÓN: ${code}`);
       } catch (err) {
         console.error("Error solicitando Pairing Code:", err);
       }
@@ -182,7 +164,7 @@ async function iniciarBot() {
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
       const remoteJid = msg.key.remoteJid || "";
-      if (remoteJid.endsWith("@g.us")) continue; // Ignorar grupos
+      if (remoteJid.endsWith("@g.us")) continue;
 
       const texto = (
         msg.message.conversation ||
@@ -193,27 +175,34 @@ async function iniciarBot() {
 
       if (!texto) continue;
 
-      // Resolver teléfono real evitando LIDs (@lid)
+      // RESOLUCIÓN REAL DE TELÉFONO EVITANDO EL IDENTIFICADOR LID
       let telefonoReal = "";
+
       if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes("@s.whatsapp.net")) {
         telefonoReal = msg.key.remoteJidAlt.split("@")[0];
+      } else if (msg.key.participantPn) {
+        telefonoReal = msg.key.participantPn.split("@")[0];
+      } else if (msg.key.senderPn) {
+        telefonoReal = msg.key.senderPn.split("@")[0];
       } else if (remoteJid.endsWith("@s.whatsapp.net")) {
         telefonoReal = remoteJid.split("@")[0];
       }
 
-      if (!telefonoReal && sock.signalRepository?.lidMapping?.getPNForLID) {
+      // Si aún sigue como @lid, resolver con el repositorio interno
+      if ((!telefonoReal || telefonoReal.length > 15) && remoteJid.includes("@lid") && sock.signalRepository?.lidMapping?.getPNForLID) {
         try {
           const pn = await sock.signalRepository.lidMapping.getPNForLID(remoteJid);
           if (pn) telefonoReal = pn.split("@")[0];
         } catch (_) {}
       }
 
+      // Fallback
       if (!telefonoReal) {
         telefonoReal = remoteJid.split("@")[0];
       }
 
       try {
-        // 1. CONSULTA DE SALDO / DEUDA / ESTADO DE CUENTA
+        // 1. CONSULTA DE SALDO / DEUDA / CARTERA
         if (/SALDO|DEUDA|CUENTA|ESTADO/.test(texto)) {
           const cuenta = await consultarCarteraPorTelefono(telefonoReal);
 
@@ -251,7 +240,7 @@ async function iniciarBot() {
                   "📌 *Nota:* Una vez realizada la operación, envíenos el comprobante emitido por el banco para validar su crédito contable."
           });
         } 
-        // 3. MENÚ PRINCIPAL / BIENVENIDA
+        // 3. MENÚ PRINCIPAL
         else if (/MENU|HOLA|BUENAS|INICIO|OPCIONES/.test(texto)) {
           await sock.sendMessage(remoteJid, {
             text: "👋 *Atención al Cliente - Mobadent*\n\n" +
@@ -261,15 +250,15 @@ async function iniciarBot() {
                   "👉 *SOPORTE*: Contactar con el área de atención y cobranza."
           });
         } 
-        // 4. ATENCIÓN AL CLIENTE / SOPORTE ADMINISTRATIVO
-        else if (/SOPORTE|ATENCION|AYUDA|HUMANO|CONTACTO/.test(texto)) {
+        // 4. ATENCIÓN Y CONTACTO
+        else if (/SOPORTE|ATENCION|AYUDA|CONTACTO/.test(texto)) {
           await sock.sendMessage(remoteJid, {
             text: "🛎️ *Atención al Cliente - Mobadent*\n\n" +
                   "Hemos registrado su solicitud. Un representante del departamento administrativo revisará este canal para brindarle atención personalizada a la brevedad posible."
           });
         }
       } catch (err) {
-        logger.error({ err }, "Error procesando mensaje");
+        console.error("Error respondiendo mensaje:", err.message);
       }
     }
   });
