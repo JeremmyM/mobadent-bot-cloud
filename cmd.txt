@@ -1,0 +1,7 @@
+cd mobadent-bot-cloud
+git init
+git add .
+git commit -m "feat: mobadent cloud bot 24/7"
+git branch -M main
+git remote add origin https://github.com/JeremmyM/mobadent-bot-cloud.git
+git push -u origin main
