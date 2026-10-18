@@ -10,9 +10,9 @@ import fs from "fs";
 import path from "path";
 import http from "http";
 
-const logger = pino({ level: "info" });
-
-// 1. SERVIDOR HTTP PARA RENDER
+// -------------------------------------------------------------------------
+// 1. SERVIDOR HTTP OBLIGATORIO PARA RENDER (HEALTHCHECK / KEEPALIVE)
+// -------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -21,7 +21,9 @@ http.createServer((req, res) => {
   console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT}`);
 });
 
-// 2. CONFIGURACIÓN Y VARIABLES
+// -------------------------------------------------------------------------
+// 2. CONFIGURACIÓN Y VARIABLES DE ENTORNO
+// -------------------------------------------------------------------------
 const DATABASE_URL = process.env.DATABASE_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -30,7 +32,7 @@ const SUPABASE_BUCKET = "whatsapp-session";
 const SESSION_DIR = path.resolve("./auth_session");
 
 if (!DATABASE_URL || !SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("❌ Faltan variables de entorno esenciales.");
+  console.error("❌ Faltan variables de entorno esenciales: DATABASE_URL, SUPABASE_URL o SUPABASE_KEY.");
   process.exit(1);
 }
 
@@ -44,9 +46,11 @@ if (!fs.existsSync(SESSION_DIR)) {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
-// 3. PERSISTENCIA EN SUPABASE
+// -------------------------------------------------------------------------
+// 3. GESTIÓN Y PERSISTENCIA DE SESIÓN EN SUPABASE
+// -------------------------------------------------------------------------
 async function descargarSesionSupabase() {
-  console.log("⬇️ Verificando y descargando sesión desde Supabase...");
+  console.log("⬇️ Verificando sesión almacenada en Supabase...");
   try {
     const { data: files, error } = await supabase.storage
       .from(SUPABASE_BUCKET)
@@ -68,7 +72,7 @@ async function descargarSesionSupabase() {
     console.log("✅ Sesión descargada y lista.");
     return true;
   } catch (err) {
-    console.error("⚠️ Error durante descarga inicial:", err.message);
+    console.error("⚠️ Error durante descarga de sesión:", err.message);
     return false;
   }
 }
@@ -77,11 +81,15 @@ async function purgarSesionRemota() {
   try {
     const { data: files } = await supabase.storage.from(SUPABASE_BUCKET).list("", { limit: 1000 });
     if (files && files.length > 0) {
-      const paths = files.map(f => f.name);
-      await supabase.storage.from(SUPABASE_BUCKET).remove(paths);
-      console.log("🗑️ Sesión inválida eliminada de Supabase Storage.");
+      const paths = files.map(f => f.name).filter(n => n !== ".emptyFolderPlaceholder");
+      if (paths.length > 0) {
+        await supabase.storage.from(SUPABASE_BUCKET).remove(paths);
+      }
+      console.log("🗑️ Archivos inválidos eliminados de Supabase Storage.");
     }
-  } catch (_) {}
+  } catch (err) {
+    console.error("Aviso purgando Supabase:", err.message);
+  }
 }
 
 async function sincronizarArchivosASupabase() {
@@ -96,11 +104,13 @@ async function sincronizarArchivosASupabase() {
       }
     }
   } catch (err) {
-    console.error("⚠️ Error sincronizando sesión a Supabase:", err.message);
+    console.error("⚠️ Error sincronizando a Supabase:", err.message);
   }
 }
 
-// 4. CONSULTA DE CARTERA NEON
+// -------------------------------------------------------------------------
+// 4. CONSULTA DE CARTERA DIRECTA EN NEON POSTGRESQL
+// -------------------------------------------------------------------------
 async function consultarCarteraPorTelefono(telefonoLimpio) {
   const digitos = telefonoLimpio.replace(/\D/g, "");
   console.log(`🔍 [BOT] Evaluando número: "${telefonoLimpio}" -> Dígitos: "${digitos}"`);
@@ -135,8 +145,15 @@ async function consultarCarteraPorTelefono(telefonoLimpio) {
   }
 }
 
-// 5. INICIALIZACIÓN
+// -------------------------------------------------------------------------
+// 5. INICIALIZACIÓN DEL BOT
+// -------------------------------------------------------------------------
+let botIniciando = false;
+
 async function iniciarBot() {
+  if (botIniciando) return;
+  botIniciando = true;
+
   await descargarSesionSupabase();
 
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -161,50 +178,53 @@ async function iniciarBot() {
     }
   }, 30000);
 
-  let pairingCodeSolicitado = false;
+  let codigoGenerado = false;
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Solo pide código si NO está registrado y el socket ya emitió evento de QR/listo
-    if ((qr || !sock.authState.creds.registered) && PHONE_NUMBER && !pairingCodeSolicitado) {
-      pairingCodeSolicitado = true;
-      setTimeout(async () => {
-        try {
-          const cleanNumber = PHONE_NUMBER.replace(/\D/g, "");
-          const code = await sock.requestPairingCode(cleanNumber);
-          console.log("\n=======================================================");
-          console.log(`📲 CÓDIGO DE VINCULACIÓN: ${code}`);
-          console.log("=======================================================\n");
-        } catch (err) {
-          pairingCodeSolicitado = false;
-          console.error("Aviso solicitando código:", err.message);
-        }
-      }, 3000);
+    // Solo se pide código cuando WhatsApp entrega QR (socket listo) y no está registrado
+    if (qr && !sock.authState.creds.registered && PHONE_NUMBER && !codigoGenerado) {
+      codigoGenerado = true;
+      try {
+        const cleanNumber = PHONE_NUMBER.replace(/\D/g, "");
+        const code = await sock.requestPairingCode(cleanNumber);
+        console.log("\n=======================================================");
+        console.log(`📲 CÓDIGO DE VINCULACIÓN: ${code}`);
+        console.log("=======================================================\n");
+      } catch (err) {
+        codigoGenerado = false;
+        console.error("Aviso solicitando código:", err.message);
+      }
     }
 
     if (connection === "close") {
       clearInterval(syncInterval);
+      botIniciando = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       console.log(`⚠️ Conexión cerrada (status: ${statusCode}).`);
 
       if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-        console.log("🔄 Sesión cerrada por WhatsApp (401). Purgando archivos locales y en Supabase...");
+        console.log("🛑 Sesión cerrada o inválida (401). Purgando credenciales...");
         try {
           fs.rmSync(SESSION_DIR, { recursive: true, force: true });
           fs.mkdirSync(SESSION_DIR, { recursive: true });
         } catch (_) {}
         await purgarSesionRemota();
-        setTimeout(iniciarBot, 3000);
+        setTimeout(iniciarBot, 5000);
       } else {
         setTimeout(iniciarBot, 5000);
       }
     } else if (connection === "open") {
+      botIniciando = false;
       console.log("\n🟢 Mobadent Bot Cloud CONECTADO y activo 24/7.\n");
       await sincronizarArchivosASupabase();
     }
   });
 
+  // -----------------------------------------------------------------------
+  // 6. GESTIÓN DE MENSAJES Y COMANDOS
+  // -----------------------------------------------------------------------
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
@@ -222,6 +242,7 @@ async function iniciarBot() {
 
       if (!texto) continue;
 
+      // Extracción limpia de número real (soporte para LIDs)
       let telefonoReal = "";
       if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes("@s.whatsapp.net")) {
         telefonoReal = msg.key.remoteJidAlt.split("@")[0];
