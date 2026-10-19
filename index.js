@@ -100,10 +100,30 @@ async function sincronizarArchivosASupabase() {
 }
 
 // -------------------------------------------------------------------------
-// 4. CONSULTA DE CARTERA EN NEON POSTGRESQL
+// 4. FUNCIONES DE APOYO Y CONSULTA DE CARTERA (NEON POSTGRESQL)
 // -------------------------------------------------------------------------
+function obtenerSaludoDoctor(cuenta) {
+  const nombre = cuenta.doctor_nombre || "";
+  const trato = (cuenta.trato || "").trim();
+
+  let encabezado = "Estimado/a Doctor/a";
+  if (/^dr\.?$/i.test(trato)) {
+    encabezado = `Estimado Dr. ${nombre}`;
+  } else if (/^dra\.?$/i.test(trato)) {
+    encabezado = `Estimada Dra. ${nombre}`;
+  } else if (trato) {
+    encabezado = `Estimado/a ${trato} ${nombre}`;
+  } else if (nombre) {
+    encabezado = `Estimado/a ${nombre}`;
+  }
+
+  return encabezado;
+}
+
 async function consultarCarteraPorTelefono(telefonoLimpio) {
   const digitos = telefonoLimpio.replace(/\D/g, "");
+  console.log(`🔍 [BOT] Evaluando número: "${telefonoLimpio}" -> Dígitos: "${digitos}"`);
+
   if (!digitos || digitos.length < 7) return null;
 
   const ultimos8 = digitos.slice(-8);
@@ -124,6 +144,7 @@ async function consultarCarteraPorTelefono(telefonoLimpio) {
   try {
     const res = await pool.query(query, params);
     if (res.rows.length > 0) {
+      console.log(`✅ [BOT] Doctor encontrado: ${res.rows[0].doctor_nombre} | Trato: ${res.rows[0].trato} | Saldo: ${res.rows[0].saldo_pendiente}`);
       return res.rows[0];
     }
     return null;
@@ -165,6 +186,7 @@ async function iniciarBot() {
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
+    // Solo se solicita Pairing Code si el socket emite evento inicial (QR) y no está registrado
     if (qr && !sock.authState.creds.registered && PHONE_NUMBER && !codigoYaSolicitado) {
       codigoYaSolicitado = true;
       try {
@@ -185,7 +207,7 @@ async function iniciarBot() {
       console.log(`⚠️ Conexión cerrada (status: ${statusCode}).`);
 
       if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-        console.log("🛑 Sesión cerrada (401). Limpiando local...");
+        console.log("🛑 Sesión cerrada o inválida (401). Limpiando credenciales locales...");
         try {
           fs.rmSync(SESSION_DIR, { recursive: true, force: true });
           fs.mkdirSync(SESSION_DIR, { recursive: true });
@@ -200,7 +222,7 @@ async function iniciarBot() {
   });
 
   // -----------------------------------------------------------------------
-  // 6. GESTIÓN INTELIGENTE DE MENSAJES Y SALUDOS
+  // 6. GESTIÓN INTELIGENTE DE MENSAJES Y RESPUESTAS
   // -----------------------------------------------------------------------
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
@@ -208,7 +230,7 @@ async function iniciarBot() {
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
       const remoteJid = msg.key.remoteJid || "";
-      if (remoteJid.endsWith("@g.us")) continue;
+      if (remoteJid.endsWith("@g.us")) continue; // Ignorar grupos
 
       const textoOriginal = (
         msg.message.conversation ||
@@ -219,13 +241,13 @@ async function iniciarBot() {
 
       if (!textoOriginal) continue;
 
-      // Normalizar texto (sin tildes, mayúsculas)
+      // Normalizar texto (mayúsculas y sin acentos)
       const textoNormalizado = textoOriginal
         .toUpperCase()
         .normalize("NFD")
         .replace(/[\u0300-\u036f]/g, "");
 
-      // Resolver número real (evitando @lid)
+      // Resolver número real evitando LIDs
       let telefonoReal = "";
       if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes("@s.whatsapp.net")) {
         telefonoReal = msg.key.remoteJidAlt.split("@")[0];
@@ -246,7 +268,7 @@ async function iniciarBot() {
 
       if (!telefonoReal) telefonoReal = remoteJid.split("@")[0];
 
-      // Expresiones regulares de intenciones
+      // Expresiones regulares de intención
       const esConsultaSaldo = /^(1)$|SALDO|CUANTO (DEBO|LES DEBO|ES MI CUENTA|TENGO QUE PAGAR)|MI (DEUDA|SALDO|ESTADO DE CUENTA|CUENTA)|DEUDA|CARTERA|PENDIENTE DE PAGO|BALANCE/i.test(textoNormalizado);
       const esConsultaBanco = /^(2)$|BANCO|CUENTA(S)? (DEL BANCO|BANCARIA(S)?|PARA PAGAR|PARA TRANSFERIR)|DATOS (BANCARIOS|DE PAGO|DE TRANSFERENCIA|PARA DEPOSITAR)|PASENME (EL BANCO|LAS CUENTAS)|TRANSFERENCIA|DEPOSITO|DONDE (PAGO|TRANSFIERO|DEPOSITO)/i.test(textoNormalizado);
       const esMenuExplicito = /^(MENU|OPCIONES|AYUDA)$/i.test(textoNormalizado);
@@ -259,26 +281,25 @@ async function iniciarBot() {
 
           if (!cuenta) {
             await sock.sendMessage(remoteJid, {
-              text: "Estimado/a Doctor/a:\n\nNo registramos una cuenta vinculada a este número en nuestro sistema de cartera.\n\nPor favor, facilítenos su número de RUC o cédula para verificar su información."
+              text: "Estimado/a Doctor/a:\n\nNo registramos una cuenta vinculada a este número de contacto en nuestro sistema de cartera.\n\nPor favor, facilítenos su número de RUC o cédula para verificar su información en administración."
             });
             continue;
           }
 
-          const trato = cuenta.trato || "Dr./Dra.";
-          const nombre = cuenta.doctor_nombre || "";
+          const saludoFormal = obtenerSaludoDoctor(cuenta);
           const saldo = parseFloat(cuenta.saldo_pendiente || 0);
 
           if (saldo > 0) {
             await sock.sendMessage(remoteJid, {
-              text: `Estimado/a ${trato} ${nombre}:\n\nSu saldo pendiente actual es de *$${saldo.toFixed(2)}*.\n\nSi ya realizó su depósito o transferencia, por favor envíenos el comprobante bancario por este chat para conciliar su pago.\n\n*(Escriba "BANCO" o "2" si necesita los datos de transferencia)*.`
+              text: `${saludoFormal}:\n\nSu saldo pendiente actual es de *$${saldo.toFixed(2)}*.\n\nSi ya realizó su depósito o transferencia, por favor envíenos el comprobante bancario por este chat para conciliar su pago.\n\n*(Escriba "BANCO" o "2" si necesita los datos de transferencia)*.`
             });
           } else {
             await sock.sendMessage(remoteJid, {
-              text: `Estimado/a ${trato} ${nombre}:\n\nSu cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\n¡Muchas gracias por su puntualidad y confianza en Mobadent!`
+              text: `${saludoFormal}:\n\nSu cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\n¡Muchas gracias por su puntualidad y confianza en Mobadent!`
             });
           }
         } 
-        // --- 2. DATOS BANCARIOS ---
+        // --- 2. DATOS BANCARIOS OFICIALES ---
         else if (esConsultaBanco) {
           await sock.sendMessage(remoteJid, {
             text: "🏦 *Datos Bancarios Oficiales - Mobadent S.A.S.*\n\n" +
@@ -288,36 +309,40 @@ async function iniciarBot() {
                   "• *Titular:* MOBADENT S.A.S.\n" +
                   "• *RUC:* 099XXXXXXXX001\n" +
                   "• *Correo:* pagos@mobadent.ec\n\n" +
-                  "📌 Al transferir, por favor adjunte la foto o captura del comprobante por este medio."
+                  "📌 Al transferir, por favor adjunte la foto o captura del comprobante por este medio para validar su crédito contable."
           });
         } 
-        // --- 3. MENÚ EXPLICÍTO (Escribió "MENU" o "AYUDA") ---
+        // --- 3. MENÚ EXPLÍCITO ---
         else if (esMenuExplicito) {
           await sock.sendMessage(remoteJid, {
             text: "👋 *Opciones de Atención - Mobadent*\n\n" +
                   "Escriba una opción o el número correspondiente:\n\n" +
                   "👉 *1* o *SALDO*: Consultar su balance contable.\n" +
-                  "👉 *2* o *BANCO*: Cuentas bancarias para pagos."
+                  "👉 *2* o *BANCO*: Cuentas bancarias oficiales para transferencias."
           });
         } 
-        // --- 4. SALUDOS AMIGABLES Y CONTROLADOS (ANTI-SPAM) ---
+        // --- 4. SALUDO AMIGABLE CON CONTROL DE SPAM ---
         else if (esSoloSaludo) {
           const ahora = Date.now();
           const ultimoSaludo = ultimosSaludos.get(remoteJid) || 0;
 
-          // Si ya saludó hace menos de 4 horas, no le repetimos el menú, solo respondemos con calidez
+          // Si ya saludó hace menos de 4 horas, respuesta cálida corta sin repetir todo el bloque
           if (ahora - ultimoSaludo < COOLDOWN_SALUDO_MS) {
             await sock.sendMessage(remoteJid, {
               text: "¡Hola! ¿En qué podemos ayudarle hoy? Escriba *SALDO* para ver su cuenta o *BANCO* para datos de pago."
             });
           } else {
-            // Primer saludo o conversación nueva: saludo personalizado y amigable
             ultimosSaludos.set(remoteJid, ahora);
             const cuenta = await consultarCarteraPorTelefono(telefonoReal);
-            const tratoNombre = cuenta ? `${cuenta.trato || "Dr./Dra."} ${cuenta.doctor_nombre}` : "Doctor/a";
+
+            let vocativo = "Doctor/a";
+            if (cuenta) {
+              const t = (cuenta.trato || "").trim();
+              vocativo = t ? `${t} ${cuenta.doctor_nombre}` : cuenta.doctor_nombre;
+            }
 
             await sock.sendMessage(remoteJid, {
-              text: `¡Hola ${tratoNombre}! Qué gusto saludarle.\n\n¿En qué podemos asistirle hoy? Puede consultar su balance escribiendo *SALDO* o pedir nuestras cuentas con la palabra *BANCO*.`
+              text: `¡Hola ${vocativo}! Qué gusto saludarle.\n\n¿En qué podemos asistirle hoy? Puede consultar su balance escribiendo *SALDO* o pedir nuestras cuentas con la palabra *BANCO*.`
             });
           }
         }
