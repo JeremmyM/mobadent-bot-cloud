@@ -10,7 +10,11 @@ import fs from "fs";
 import path from "path";
 import http from "http";
 
-// 1. SERVIDOR HTTP PARA RENDER WEB SERVICE
+const logger = pino({ level: "info" });
+
+// -------------------------------------------------------------------------
+// 1. SERVIDOR HTTP PARA RENDER WEB SERVICE (KEEPALIVE)
+// -------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -19,7 +23,9 @@ http.createServer((req, res) => {
   console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT}`);
 });
 
+// -------------------------------------------------------------------------
 // 2. CONFIGURACIÓN Y VARIABLES DE ENTORNO
+// -------------------------------------------------------------------------
 const DATABASE_URL = process.env.DATABASE_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -28,7 +34,7 @@ const SUPABASE_BUCKET = "whatsapp-session";
 const SESSION_DIR = path.resolve("./auth_session");
 
 if (!DATABASE_URL || !SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("❌ Faltan variables de entorno esenciales.");
+  console.error("❌ Faltan variables de entorno esenciales: DATABASE_URL, SUPABASE_URL o SUPABASE_KEY.");
   process.exit(1);
 }
 
@@ -42,7 +48,9 @@ if (!fs.existsSync(SESSION_DIR)) {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
-// 3. PERSISTENCIA DE SESIÓN EN SUPABASE STORAGE
+// -------------------------------------------------------------------------
+// 3. PERSISTENCIA DE SESIÓN CON SUPABASE STORAGE
+// -------------------------------------------------------------------------
 async function descargarSesionSupabase() {
   console.log("⬇️ Verificando sesión almacenada en Supabase...");
   try {
@@ -87,7 +95,9 @@ async function sincronizarArchivosASupabase() {
   }
 }
 
+// -------------------------------------------------------------------------
 // 4. CONSULTA DE CARTERA EN NEON POSTGRESQL
+// -------------------------------------------------------------------------
 async function consultarCarteraPorTelefono(telefonoLimpio) {
   const digitos = telefonoLimpio.replace(/\D/g, "");
   console.log(`🔍 [BOT] Evaluando número: "${telefonoLimpio}" -> Dígitos: "${digitos}"`);
@@ -122,7 +132,9 @@ async function consultarCarteraPorTelefono(telefonoLimpio) {
   }
 }
 
-// 5. INICIALIZACIÓN CONTROLADA
+// -------------------------------------------------------------------------
+// 5. INICIALIZACIÓN CONTROLADA DEL BOT
+// -------------------------------------------------------------------------
 let codigoYaSolicitado = false;
 
 async function iniciarBot() {
@@ -135,7 +147,6 @@ async function iniciarBot() {
     version,
     auth: state,
     logger: pino({ level: "silent" }),
-    printQRInTerminal: true, // <-- Cambiar a true
     defaultQueryTimeoutMs: 60000
   });
 
@@ -153,7 +164,7 @@ async function iniciarBot() {
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Solicitar código solo una vez cuando el socket está listo y no está registrado
+    // Solo se solicita Pairing Code cuando el socket está listo y no está registrado
     if (qr && !sock.authState.creds.registered && PHONE_NUMBER && !codigoYaSolicitado) {
       codigoYaSolicitado = true;
       try {
@@ -174,8 +185,11 @@ async function iniciarBot() {
       console.log(`⚠️ Conexión cerrada (status: ${statusCode}).`);
 
       if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-        console.log("🛑 Sesión inválida (401). Si eliminaste los archivos en Supabase, reinicia el servicio manualmente en Render para empezar de cero.");
-        // NO llamamos a iniciarBot() aquí para frenar en seco el bucle de spam
+        console.log("🛑 Sesión cerrada o inválida (401). Limpiando credenciales locales...");
+        try {
+          fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+          fs.mkdirSync(SESSION_DIR, { recursive: true });
+        } catch (_) {}
       } else {
         setTimeout(iniciarBot, 5000);
       }
@@ -185,23 +199,34 @@ async function iniciarBot() {
     }
   });
 
+  // -----------------------------------------------------------------------
+  // 6. GESTIÓN DE MENSAJES Y RECONOCIMIENTO INTELIGENTE DE INTENCIONES
+  // -----------------------------------------------------------------------
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
       const remoteJid = msg.key.remoteJid || "";
-      if (remoteJid.endsWith("@g.us")) continue;
+      if (remoteJid.endsWith("@g.us")) continue; // Ignorar grupos
 
-      const texto = (
+      // Limpieza y normalización del texto recibido
+      const textoOriginal = (
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         msg.message.imageMessage?.caption ||
         ""
-      ).trim().toUpperCase();
+      ).trim();
 
-      if (!texto) continue;
+      if (!textoOriginal) continue;
 
+      // Normalizar texto: a mayúsculas y sin acentos para comparaciones infalibles
+      const textoNormalizado = textoOriginal
+        .toUpperCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "");
+
+      // Extracción prioritaria del número real
       let telefonoReal = "";
       if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes("@s.whatsapp.net")) {
         telefonoReal = msg.key.remoteJidAlt.split("@")[0];
@@ -222,13 +247,27 @@ async function iniciarBot() {
 
       if (!telefonoReal) telefonoReal = remoteJid.split("@")[0];
 
+      // =====================================================================
+      // INTENCIONES MEDIANTE EXPRESIONES REGULARES
+      // =====================================================================
+      
+      // 1. Intención de Saldo / Estado de Cartera / Cuánto debo
+      const esConsultaSaldo = /^(1)$|SALDO|CUANTO (DEBO|LES DEBO|ES MI CUENTA|TENGO QUE PAGAR)|MI (DEUDA|SALDO|ESTADO DE CUENTA|CUENTA)|DEUDA|CARTERA|PENDIENTE DE PAGO|BALANCE/i.test(textoNormalizado);
+
+      // 2. Intención de Banco / Cuentas Bancarias / Transferencia
+      const esConsultaBanco = /^(2)$|BANCO|CUENTA(S)? (DEL BANCO|BANCARIA(S)?|PARA PAGAR|PARA TRANSFERIR)|DATOS (BANCARIOS|DE PAGO|DE TRANSFERENCIA|PARA DEPOSITAR)|PASENME (EL BANCO|LAS CUENTAS)|TRANSFERENCIA|DEPOSITO|DONDE (PAGO|TRANSFIERO|DEPOSITO)/i.test(textoNormalizado);
+
+      // 3. Menú o Saludos
+      const esConsultaMenu = /^(MENU|INICIO|OPCIONES|AYUDA|HOLA|BUENAS|BUENOS DIAS|BUENAS TARDES|BUENAS NOCHES)$/i.test(textoNormalizado);
+
       try {
-        if (/SALDO|DEUDA|CUENTA|ESTADO/.test(texto)) {
+        // --- CASO 1: CONSULTA DE SALDO ---
+        if (esConsultaSaldo) {
           const cuenta = await consultarCarteraPorTelefono(telefonoReal);
 
           if (!cuenta) {
             await sock.sendMessage(remoteJid, {
-              text: "Estimado/a Doctor/a:\n\nNo registramos una cuenta vinculada a este número de contacto en nuestro sistema de cartera.\n\nPor favor, envíenos sus nombres completos o su número de identificación para que el área de atención al cliente pueda asistirle formalmente."
+              text: "Estimado/a Doctor/a:\n\nNo registramos una cuenta vinculada a este número de contacto en nuestro sistema de cartera.\n\nPor favor, envíenos su número de identificación fiscal (RUC/Cédula) o nombres completos para que el área de atención pueda verificar su registro formalmente."
             });
             continue;
           }
@@ -239,14 +278,16 @@ async function iniciarBot() {
 
           if (saldo > 0) {
             await sock.sendMessage(remoteJid, {
-              text: `Estimado/a ${trato} ${nombre}:\n\nLe informamos que su saldo pendiente actual es de *$${saldo.toFixed(2)}*.\n\nSi ya realizó su transferencia o depósito, por favor adjunte su comprobante por este medio para registrar su conciliación. ¡Agradecemos su puntualidad y confianza en Mobadent!`
+              text: `Estimado/a ${trato} ${nombre}:\n\nLe informamos que su saldo pendiente actual es de *$${saldo.toFixed(2)}*.\n\nSi ya realizó su depósito o transferencia, por favor envíenos el comprobante bancario por este medio para registrar su conciliación contable. Puede escribir *BANCO* o *2* para obtener las cuentas oficiales.`
             });
           } else {
             await sock.sendMessage(remoteJid, {
-              text: `Estimado/a ${trato} ${nombre}:\n\nNos complace informarle que su cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\nMuchas gracias por su preferencia comercial con Mobadent.`
+              text: `Estimado/a ${trato} ${nombre}:\n\nNos complace informarle que su cuenta se encuentra actualmente *AL DÍA* (Saldo: $0.00).\n\nMuchas gracias por su puntualidad y confianza en Mobadent.`
             });
           }
-        } else if (/BANCO|TRANSFERENCIA|PAGO|DATOS/.test(texto)) {
+        } 
+        // --- CASO 2: DATOS BANCARIOS ---
+        else if (esConsultaBanco) {
           await sock.sendMessage(remoteJid, {
             text: "🏦 *DATOS BANCARIOS OFICIALES - MOBADENT S.A.S.*\n\n" +
                   "• *Institución Financiera:* Banco Pichincha\n" +
@@ -254,21 +295,18 @@ async function iniciarBot() {
                   "• *Número de Cuenta:* 2100XXXXXX\n" +
                   "• *Titular:* MOBADENT S.A.S.\n" +
                   "• *RUC:* 099XXXXXXXX001\n" +
-                  "• *Correo de Facturación/Cobranza:* pagos@mobadent.ec\n\n" +
-                  "📌 *Nota:* Una vez realizada la operación, envíenos el comprobante emitido por el banco para validar su crédito contable."
+                  "• *Correo de Facturación:* pagos@mobadent.ec\n\n" +
+                  "📌 *Nota:* Una vez realizada la operación, envíenos la fotografía o archivo digital del comprobante por este medio para conciliar su abono contable."
           });
-        } else if (/MENU|HOLA|BUENAS|INICIO|OPCIONES/.test(texto)) {
+        } 
+        // --- CASO 3: MENÚ PRINCIPAL ---
+        else if (esConsultaMenu) {
           await sock.sendMessage(remoteJid, {
             text: "👋 *Atención al Cliente - Mobadent*\n\n" +
-                  "Por favor, seleccione o escriba una de las siguientes opciones:\n\n" +
-                  "👉 *SALDO*: Consulta de balance contable y estado de cartera.\n" +
-                  "👉 *BANCO*: Información de cuentas oficiales para pagos.\n" +
-                  "👉 *SOPORTE*: Contactar con el área de atención y cobranza."
-          });
-        } else if (/SOPORTE|ATENCION|AYUDA|CONTACTO/.test(texto)) {
-          await sock.sendMessage(remoteJid, {
-            text: "🛎️ *Atención al Cliente - Mobadent*\n\n" +
-                  "Hemos registrado su solicitud. Un representante del departamento administrativo revisará este canal para brindarle atención personalizada a la brevedad posible."
+                  "Bienvenido al canal corporativo de consultas. Por favor, elija una opción escribiendo el número o la palabra deseada:\n\n" +
+                  "👉 *1* o *SALDO*: Consulta de balance contable y estado de cartera.\n" +
+                  "👉 *2* o *BANCO*: Información de cuentas bancarias oficiales para pagos.\n\n" +
+                  "Escriba *MENU* en cualquier momento para volver a ver estas opciones."
           });
         }
       } catch (err) {
@@ -277,8 +315,5 @@ async function iniciarBot() {
     }
   });
 }
-
-
-
 
 iniciarBot().catch(console.error);
